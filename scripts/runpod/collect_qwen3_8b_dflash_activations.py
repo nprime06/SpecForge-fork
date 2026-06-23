@@ -96,6 +96,8 @@ def tokenize_with_assistant_mask(tokenizer, messages, max_length: int) -> dict[s
         if assistant_mask is None:
             raise ValueError("chat template did not return an assistant mask")
         loss_mask = assistant_mask[0].to(torch.long)
+        if loss_mask.sum().item() == 0:
+            raise ValueError("chat template returned an empty assistant mask")
     except Exception:
         # Fallback for chat templates without assistant mask support. This is
         # less exact but keeps collection moving; the manifest records it.
