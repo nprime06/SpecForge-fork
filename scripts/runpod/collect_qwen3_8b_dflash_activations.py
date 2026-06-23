@@ -73,6 +73,22 @@ def normalize_messages(row: dict[str, Any]) -> list[dict[str, str]] | None:
 
 
 def tokenize_with_assistant_mask(tokenizer, messages, max_length: int) -> dict[str, torch.Tensor] | None:
+    def fallback_template_ids(prefix_messages) -> torch.Tensor:
+        if not prefix_messages:
+            return torch.empty(0, dtype=torch.long)
+        text = tokenizer.apply_chat_template(
+            prefix_messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        encoded = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+        )
+        return encoded["input_ids"][0].to(torch.long)
+
     try:
         encoded = tokenizer.apply_chat_template(
             messages,
@@ -101,37 +117,16 @@ def tokenize_with_assistant_mask(tokenizer, messages, max_length: int) -> dict[s
     except Exception:
         # Fallback for chat templates without assistant mask support. This is
         # less exact but keeps collection moving; the manifest records it.
-        prompt_ids = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_length,
-            add_generation_prompt=False,
-        )[0].to(torch.long)
+        prompt_ids = fallback_template_ids(messages)
         input_ids = prompt_ids
         attention_mask = torch.ones_like(input_ids)
         loss_mask = torch.zeros_like(input_ids)
         cursor = 0
         for idx, msg in enumerate(messages):
-            prefix = tokenizer.apply_chat_template(
-                messages[:idx],
-                tokenize=True,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_length,
-                add_generation_prompt=False,
-            )
-            upto = tokenizer.apply_chat_template(
-                messages[: idx + 1],
-                tokenize=True,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_length,
-                add_generation_prompt=False,
-            )
-            start = min(prefix.shape[-1], input_ids.numel())
-            end = min(upto.shape[-1], input_ids.numel())
+            prefix = fallback_template_ids(messages[:idx])
+            upto = fallback_template_ids(messages[: idx + 1])
+            start = min(prefix.numel(), input_ids.numel())
+            end = min(upto.numel(), input_ids.numel())
             if msg["role"] == "assistant" and end > start:
                 loss_mask[start:end] = 1
             cursor = end
