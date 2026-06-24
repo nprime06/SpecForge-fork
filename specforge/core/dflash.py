@@ -117,6 +117,10 @@ class OnlineDFlashModel(nn.Module):
         loss_decay_gamma: Optional[float] = None,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
+        anchor_sampling: str = "uniform",
+        hard_anchor_boost: float = 3.0,
+        hard_anchor_head_fraction: float = 0.2,
+        hard_anchor_tail_fraction: float = 0.1,
     ):
         super().__init__()
         if loss_type not in _VALID_LOSS_TYPES:
@@ -136,10 +140,20 @@ class OnlineDFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
+        self.anchor_sampling = anchor_sampling
+        self.hard_anchor_boost = hard_anchor_boost
+        self.hard_anchor_head_fraction = hard_anchor_head_fraction
+        self.hard_anchor_tail_fraction = hard_anchor_tail_fraction
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
+
+        if self.anchor_sampling not in {"uniform", "hard_position"}:
+            raise ValueError(
+                "anchor_sampling must be 'uniform' or 'hard_position', "
+                f"got {self.anchor_sampling!r}"
+            )
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -164,7 +178,23 @@ class OnlineDFlashModel(nn.Module):
         )
 
         random_vals = torch.rand(bsz, max_anchor + 1, device=device)
-        random_vals = torch.where(valid, random_vals, torch.tensor(2.0, device=device))
+        if self.anchor_sampling == "hard_position" and max_anchor > 0:
+            relative = torch.arange(max_anchor + 1, device=device, dtype=torch.float32)
+            relative = relative / float(max_anchor)
+            is_hard_region = (relative <= self.hard_anchor_head_fraction) | (
+                relative >= 1.0 - self.hard_anchor_tail_fraction
+            )
+            weights = torch.ones_like(relative)
+            weights = torch.where(
+                is_hard_region,
+                weights * max(self.hard_anchor_boost, 1.0),
+                weights,
+            )
+            # Gumbel top-k samples without replacement from categorical weights.
+            random_vals = -torch.log(random_vals.clamp_min(1e-6)) / weights.unsqueeze(0)
+        random_vals = torch.where(
+            valid, random_vals, torch.tensor(float("inf"), device=device)
+        )
 
         _, sorted_idx = random_vals.sort(dim=1)
         gathered = torch.gather(masked_indices, 1, sorted_idx)

@@ -27,7 +27,6 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from huggingface_hub import HfApi, create_repo, upload_folder
 from specforge.core.dflash import OnlineDFlashModel
-from specforge.data.preprocessing import list_local_files
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
@@ -88,6 +87,15 @@ def parse_args():
     model.add_argument("--embedding-key", type=str, default=None)
     model.add_argument("--lm-head-key", type=str, default=None)
     model.add_argument("--trust-remote-code", action="store_true")
+    model.add_argument(
+        "--anchor-sampling",
+        choices=["uniform", "hard_position"],
+        default="uniform",
+        help="Anchor sampler for DFlash training.",
+    )
+    model.add_argument("--hard-anchor-boost", type=float, default=3.0)
+    model.add_argument("--hard-anchor-head-fraction", type=float, default=0.2)
+    model.add_argument("--hard-anchor-tail-fraction", type=float, default=0.1)
 
     data = parser.add_argument_group("data")
     data.add_argument("--train-hidden-states-path", action="append", required=True)
@@ -147,9 +155,16 @@ def _collect_files(
     seed: int,
     shuffle_files: bool,
 ) -> list[str]:
+    suffixes = (".ckpt", ".ckpt.gz")
     files: list[str] = []
     for path in paths:
-        files.extend(list_local_files(path))
+        root = Path(path)
+        if root.is_file() and root.name.endswith(suffixes):
+            files.append(str(root))
+            continue
+        for candidate in root.rglob("*"):
+            if candidate.is_file() and candidate.name.endswith(suffixes):
+                files.append(str(candidate))
     if not files:
         raise FileNotFoundError(f"no .ckpt files under {list(paths)}")
     files = sorted(files)
@@ -473,6 +488,10 @@ def main():
         loss_decay_gamma=args.loss_decay_gamma,
         loss_type=args.loss_type,
         dpace_alpha=args.dpace_alpha,
+        anchor_sampling=args.anchor_sampling,
+        hard_anchor_boost=args.hard_anchor_boost,
+        hard_anchor_head_fraction=args.hard_anchor_head_fraction,
+        hard_anchor_tail_fraction=args.hard_anchor_tail_fraction,
     ).to(device)
     if world_size > 1:
         model = DistributedDataParallel(
