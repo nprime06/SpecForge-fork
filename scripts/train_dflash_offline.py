@@ -70,6 +70,141 @@ def should_skip_batch(local_skip: bool, device: torch.device, world_size: int) -
     return bool(flag.item())
 
 
+def zeropower_via_newtonschulz5(
+    grad: torch.Tensor, steps: int, eps: float = 1e-7
+) -> torch.Tensor:
+    """Approximate the zeroth power / polar factor used by Muon."""
+    original_shape = grad.shape
+    matrix = grad.float().reshape(original_shape[0], -1)
+    transposed = matrix.shape[0] > matrix.shape[1]
+    if transposed:
+        matrix = matrix.T
+
+    matrix = matrix / (matrix.norm() + eps)
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(steps):
+        gram = matrix @ matrix.T
+        matrix = a * matrix + (b * gram + c * gram @ gram) @ matrix
+
+    if transposed:
+        matrix = matrix.T
+    return matrix.reshape(original_shape).to(dtype=grad.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """Small Muon optimizer for matrix-like parameters."""
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float = 0.95,
+        weight_decay: float = 0.0,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+    ):
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            weight_decay = group["weight_decay"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                grad = param.grad
+                if weight_decay != 0:
+                    param.mul_(1 - lr * weight_decay)
+
+                state = self.state[param]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(param)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(grad)
+                update = grad.add(buf, alpha=momentum) if nesterov else buf
+                update = zeropower_via_newtonschulz5(update, ns_steps)
+
+                rows = update.reshape(update.shape[0], -1).shape[0]
+                cols = update.reshape(update.shape[0], -1).shape[1]
+                scale = max(1.0, rows / cols) ** 0.5
+                param.add_(update, alpha=-lr * scale)
+        return loss
+
+
+class OptimizerGroup:
+    """A minimal multi-optimizer wrapper with the methods this trainer uses."""
+
+    def __init__(self, optimizers: list[torch.optim.Optimizer]):
+        self.optimizers = optimizers
+        self.param_groups = [
+            group for optimizer in optimizers for group in optimizer.param_groups
+        ]
+
+    def step(self):
+        for optimizer in self.optimizers:
+            optimizer.step()
+
+    def zero_grad(self, set_to_none: bool = True):
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        return {
+            "optimizers": [optimizer.state_dict() for optimizer in self.optimizers],
+            "types": [optimizer.__class__.__name__ for optimizer in self.optimizers],
+        }
+
+
+def build_optimizer(args, model: torch.nn.Module):
+    params = [p for p in model.parameters() if p.requires_grad]
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(
+            params,
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+
+    muon_params = [p for p in params if p.ndim >= 2]
+    adamw_params = [p for p in params if p.ndim < 2]
+    optimizers: list[torch.optim.Optimizer] = []
+    if muon_params:
+        optimizers.append(
+            Muon(
+                muon_params,
+                lr=args.learning_rate,
+                momentum=args.muon_momentum,
+                weight_decay=args.weight_decay,
+                nesterov=not args.muon_disable_nesterov,
+                ns_steps=args.muon_ns_steps,
+            )
+        )
+    if adamw_params:
+        optimizers.append(
+            torch.optim.AdamW(
+                adamw_params,
+                lr=args.muon_adamw_lr or args.learning_rate,
+                weight_decay=args.weight_decay,
+            )
+        )
+    return OptimizerGroup(optimizers)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
 
@@ -119,6 +254,11 @@ def parse_args():
     training.add_argument("--loss-type", default="dflash")
     training.add_argument("--dpace-alpha", type=float, default=0.5)
     training.add_argument("--loss-decay-gamma", type=float, default=None)
+    training.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw")
+    training.add_argument("--muon-momentum", type=float, default=0.95)
+    training.add_argument("--muon-ns-steps", type=int, default=5)
+    training.add_argument("--muon-adamw-lr", type=float, default=None)
+    training.add_argument("--muon-disable-nesterov", action="store_true")
 
     output = parser.add_argument_group("output")
     output.add_argument("--output-dir", required=True)
@@ -502,11 +642,18 @@ def main():
         )
     model.train()
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = build_optimizer(args, model)
+    if is_main:
+        print(
+            json.dumps(
+                {
+                    "optimizer": args.optimizer,
+                    "optimizer/param_groups": len(optimizer.param_groups),
+                    "optimizer/lr": optimizer.param_groups[0]["lr"],
+                }
+            ),
+            flush=True,
+        )
 
     run = None
     if args.wandb_project and is_main:
